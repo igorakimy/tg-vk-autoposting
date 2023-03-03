@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/SevereCloud/vksdk/v2/api"
 	"github.com/go-co-op/gocron"
