@@ -43,10 +43,7 @@ func main() {
 	defer conn.Close()
 
 	// Создать подключение к телеграм боту
-	bot, err := tgbotapi.NewBotAPI(cfg.Services.Telegram.Token)
-	if err != nil {
-		log.Panic(err)
-	}
+	bot := createNewTelegramBot(cfg.Services.Telegram.Token)
 
 	// Создать подключение к апи Вконтакте
 	vk := api.NewVK(cfg.Services.Vkontakte.Token)
@@ -56,13 +53,13 @@ func main() {
 	defer close(nChannel)
 
 	// Запустить Telegram бота
-	go runTelegramBot(bot, cfg)
+	go runRecoverableTask(func() { runTelegramBot(bot, cfg) })
 	// Запустить приложение VK
-	go runVkontakteApp(vk, cfg)
+	go runRecoverableTask(func() { runVkontakteApp(vk, cfg) })
 	// Запустить парсинг RSS Youtube
-	go runRssParser(cfg, database, nChannel)
-
-	startScheduling(cfg, vk, sendFilesToVkontakte)
+	go runRecoverableTask(func() { runRssParser(cfg, database, nChannel) })
+	// Запустить планировщик отправки сообщений VK
+	go runRecoverableTask(func() { startScheduling(cfg, vk, sendFilesToVkontakte) })
 
 	// Ожидаем получения новых записей, полученных по RSS
 	for {
@@ -84,18 +81,38 @@ func main() {
 	}
 }
 
+// createNewTelegramBot создает и возвращает новый экземпляр tgbotapi.BotAPI.
+func createNewTelegramBot(token string) *tgbotapi.BotAPI {
+	bot, err := tgbotapi.NewBotAPI(token)
+	defer func() {
+		if err := recover(); err != nil {
+			log.Println("Соединение с интернетом отсутствует. Переподключение...")
+			time.Sleep(time.Second * 10)
+			main()
+		}
+	}()
+	if err != nil {
+		log.Panicf("Ошибка подключения к телеграм: %v", err)
+	}
+	return bot
+}
+
 // runRssParser парсит RSS Youtube и отправляет новые записи о
 // появившихся видео в соответствующий канал
 func runRssParser(cfg *Config, db *Database, nChannel chan []Post) {
+	// defer recoverApp()
 	for {
 		posts := make(map[string]Post)
 		var postIDs []string
 		fp := gofeed.NewParser()
 		// Парсим RSS
-		feed, _ := fp.ParseURL(fmt.Sprintf(
+		feed, err := fp.ParseURL(fmt.Sprintf(
 			"https://www.youtube.com/feeds/videos.xml?channel_id=%s",
 			cfg.Services.Youtube.ChannelID),
 		)
+		if err != nil {
+			log.Panicf("Ошибка при попытке парсинга RSS: %v", err)
+		}
 		// Заполняем массив постов
 		for _, item := range feed.Items {
 			post := Post{
@@ -111,7 +128,7 @@ func runRssParser(cfg *Config, db *Database, nChannel chan []Post) {
 		// Получить из бд записи по ID video из RSS
 		postsList, err := db.GetPostsByIds(postIDs...)
 		if err != nil {
-			log.Fatalf("Ошибка получения нескольких видео по ID: %v", err)
+			log.Panicf("Ошибка получения нескольких видео по ID: %v", err)
 		}
 
 		// Удалить те записи из результирующего списка, которые уже есть в бд
@@ -142,13 +159,14 @@ func runRssParser(cfg *Config, db *Database, nChannel chan []Post) {
 
 // runVkontakteApp запускает полинг приложения в VK
 func runVkontakteApp(vk *api.VK, cfg *Config) {
+	// defer recoverApp()
 	lp, err := longpoll.NewLongPoll(vk, cfg.Services.Vkontakte.GroupID)
 	if err != nil {
-		log.Fatal(err)
+		log.Panicf("Ошибка поллинга Вконтакте: %v", err)
 	}
 	log.Println("Начат поллинг приложения Вконтакте")
 	if err := lp.Run(); err != nil {
-		log.Fatal(err)
+		log.Panicf("Поллинг Вконтакте остановлен: %v", err)
 	}
 }
 
@@ -176,7 +194,7 @@ func sendPostToTelegram(bot *tgbotapi.BotAPI, cfg *Config, post *Post) {
 		),
 	)
 	if _, err := bot.Send(msg); err != nil {
-		log.Println(err)
+		log.Panicf("Пост в Телеграм не был отправлен: %v", err)
 	}
 	log.Println("Пост в Телеграм отправлен")
 }
@@ -194,7 +212,7 @@ func sendPostToVkontakte(vk *api.VK, cfg *Config, post *Post) {
 	b.Attachments(fmt.Sprintf("https://youtu.be/%s", post.VideoID))
 	_, err := vk.WallPost(b.Params)
 	if err != nil {
-		log.Fatal(err)
+		log.Panicf("Пост во Вконтакте не был отправлен: %v", err)
 	}
 	log.Println("Пост во Вконтакте отправлен")
 }
@@ -204,26 +222,31 @@ func sendFilesToVkontakte(vk *api.VK, cfg *Config) {
 	var photos = make([]api.PhotosSaveWallPhotoResponse, 0)
 
 	// Загружаем файлы на сервера VK
-	for _, file := range strings.Split(cfg.App.CustomPost.Files, ",") {
-		f, err := os.Open(file)
-		if err != nil {
-			log.Fatalf("Файл не найден: %v", err)
+	if len(cfg.App.CustomPost.Files) > 0 {
+		for _, file := range strings.Split(cfg.App.CustomPost.Files, ",") {
+			f, err := os.Open(file)
+			if err != nil {
+				log.Fatalf("Файл не найден: %v", err)
+			}
+			photo, err := vk.UploadGroupWallPhoto(cfg.Services.Vkontakte.GroupID, f)
+			if err != nil {
+				log.Fatalf("Ошибка загрузки файла на сервер: %v", err)
+			}
+			photos = append(photos, photo)
 		}
-		photo, err := vk.UploadGroupWallPhoto(cfg.Services.Vkontakte.GroupID, f)
-		if err != nil {
-			log.Fatalf("Ошибка загрузки файла на сервер: %v", err)
-		}
-		photos = append(photos, photo)
 	}
 
 	b := params.NewWallPostBuilder()
 	var attachments []string
 	b.OwnerID(-cfg.Services.Vkontakte.GroupID)
-	for _, photo := range photos {
-		attachments = append(attachments, fmt.Sprintf("photo%d_%d", photo[0].OwnerID, photo[0].ID))
+
+	if len(photos) > 0 {
+		for _, photo := range photos {
+			attachments = append(attachments, fmt.Sprintf("photo%d_%d", photo[0].OwnerID, photo[0].ID))
+		}
+		// Прикрепляем файлы к посту
+		b.Attachments(strings.Join(attachments, ","))
 	}
-	// Прикрепляем файлы к посту
-	b.Attachments(strings.Join(attachments, ","))
 
 	// Прикрепляем сообщение, если оно имеется
 	if cfg.App.CustomPost.Message != "" {
@@ -233,7 +256,20 @@ func sendFilesToVkontakte(vk *api.VK, cfg *Config) {
 	// Отправляем пост
 	_, err := vk.WallPost(b.Params)
 	if err != nil {
-		log.Fatal(err)
+		log.Panicf("Пост во Вконтакте не был отправлен: %v", err)
 	}
 	log.Println("Пост во Вконтакте отправлен")
+}
+
+// runRecoverableTask выполняет функцию и в случае, если она запаникует,
+// выполняет ее повторно, через определенный таймаут.
+func runRecoverableTask(task func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Println("Соединение с интернетом отсутствует. Переподключение...")
+			time.Sleep(time.Second * 10)
+			go runRecoverableTask(task)
+		}
+	}()
+	task()
 }
